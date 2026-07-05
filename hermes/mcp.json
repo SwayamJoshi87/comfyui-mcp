@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "comfyui": {
+      "command": "/home/server/comfyui-mcp/.venv/bin/python",
+      "args": ["-u", "-m", "comfyui_mcp.server"],
+      "env": {
+        "COMFYUI_WRAPPER_URL": "http://192.168.2.51:8002",
+        "PYTHONIOENCODING": "utf-8"
+      },
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}

@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Model weights / outputs
+*.safetensors
+*.ckpt
+*.pth
+output/
+outputs/
+tmp/
+
+# Logs
+*.log
