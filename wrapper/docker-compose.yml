@@ -6,12 +6,13 @@ services:
     restart: unless-stopped
     runtime: nvidia
     ports:
-      - "8002:8000"    # API wrapper (MCP server talks to this)
+      - "8002:8000"    # OpenAI/FAL-compatible API
       - "8190:8188"    # ComfyUI direct (optional - for debugging)
     environment:
       - IDLE_TIMEOUT=300
       - COMFYUI_PORT=8188
       - API_PORT=8000
+      - PUBLIC_URL=http://192.168.2.51:8002
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:

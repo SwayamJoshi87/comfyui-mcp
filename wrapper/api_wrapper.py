@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ComfyUI OpenAI-Compatible Auto API - starts on demand, shuts down after idle.
+ComfyUI OpenAI/FAL-Compatible Auto API - starts on demand, shuts down after idle.
 USAGE: python3 api_wrapper.py [--port 8000] [--comfy-port 8188] [--idle-timeout 300] [--models-dir ...]
 """
 
@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from typing import Literal
 
 import httpx
@@ -21,6 +22,7 @@ from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -39,19 +41,40 @@ IDLE_TIMEOUT = args.idle_timeout
 BASE_URL = f"http://127.0.0.1:{COMFYUI_PORT}"
 API_KEY = os.environ.get("OPENAI_API_KEY")
 MODEL_ID = os.environ.get("MODEL_ID", "comfyui-sd1-5")
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
+OUTPUT_DIR = os.path.join(COMFYUI_DIR, "output")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # --- App ---
-app = FastAPI(title="ComfyUI OpenAI-Compatible Auto API")
+app = FastAPI(title="ComfyUI OpenAI/FAL-Compatible Auto API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
 
 comfyui_process: subprocess.Popen | None = None
 last_request_time: float = 0.0
 state_lock = threading.Lock()
+
+# Size maps for FAL compatibility
+FAL_SIZE_MAP = {
+    "square_hd": (1024, 1024),
+    "square": (1024, 1024),
+    "portrait_4_3": (768, 1024),
+    "portrait_16_9": (1024, 1536),
+    "landscape_4_3": (1024, 768),
+    "landscape_16_9": (1536, 1024),
+}
+FAL_ASPECT_MAP = {
+    "1:1": (1024, 1024),
+    "16:9": (1536, 1024),
+    "9:16": (1024, 1536),
+    "4:3": (1024, 768),
+    "3:4": (768, 1024),
+}
 
 
 class GenerateRequest(BaseModel):
@@ -92,6 +115,28 @@ class ImageGenerationRequest(BaseModel):
         if width < 256 or width > 2048 or height < 256 or height > 2048:
             raise ValueError("size dimensions must be between 256 and 2048")
         return value
+
+
+class FalGenerateRequest(BaseModel):
+    """FAL.ai-compatible text-to-image request body."""
+
+    prompt: str = Field(..., min_length=1)
+    negative_prompt: str | None = Field(default=None)
+    image_size: str | None = Field(default=None)
+    aspect_ratio: str | None = Field(default=None)
+    width: int | None = Field(default=None, ge=256, le=2048)
+    height: int | None = Field(default=None, ge=256, le=2048)
+    seed: int | None = Field(default=None)
+    num_inference_steps: int | None = Field(default=None, ge=1, le=150)
+    guidance_scale: float | None = Field(default=None, ge=1.0, le=30.0)
+    num_images: int | None = Field(default=1, ge=1, le=4)
+    image_url: str | None = Field(default=None)
+    reference_image_urls: list[str] | None = Field(default=None)
+    enable_safety_checker: bool | None = Field(default=False)
+    # Accept and ignore provider-specific fields
+    quality: str | None = Field(default=None)
+    style: str | None = Field(default=None)
+    output_format: str | None = Field(default="png")
 
 
 def _openai_error(
@@ -141,6 +186,15 @@ async def _check_auth(authorization: str | None) -> JSONResponse | None:
     if scheme.lower() != "bearer" or token != API_KEY:
         return _error_response("Invalid API key", 401, type_="authentication_error")
     return None
+
+
+def _public_url(request: Request) -> str:
+    if PUBLIC_URL:
+        return PUBLIC_URL
+    # Fall back to the request's own base URL.
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host", request.headers.get("host", request.url.hostname))
+    return f"{scheme}://{host}"
 
 
 def is_process_alive() -> bool:
@@ -259,6 +313,33 @@ def build_workflow(prompt, neg, w, h, steps, cfg, seed, bs):
     }
 
 
+def _resolve_size(
+    image_size: str | None,
+    aspect_ratio: str | None,
+    width: int | None,
+    height: int | None,
+    default: tuple[int, int] = (512, 512),
+) -> tuple[int, int]:
+    if width is not None and height is not None:
+        return (width, height)
+    if image_size:
+        size = FAL_SIZE_MAP.get(image_size)
+        if size:
+            return size
+        # Try OpenAI-style WIDTHxHEIGHT
+        try:
+            w, h = (int(x) for x in image_size.lower().split("x"))
+            if 256 <= w <= 2048 and 256 <= h <= 2048:
+                return (w, h)
+        except ValueError:
+            pass
+    if aspect_ratio:
+        size = FAL_ASPECT_MAP.get(aspect_ratio)
+        if size:
+            return size
+    return default
+
+
 async def _do_generate(
     prompt: str,
     negative_prompt: str,
@@ -269,11 +350,10 @@ async def _do_generate(
     seed: int,
     batch_size: int,
 ) -> dict:
-    """Core generation logic shared by /generate and /v1/images/generations."""
+    """Core generation logic. Returns metadata with saved file paths."""
     global last_request_time
     last_request_time = time.time()
 
-    # Start ComfyUI if not running (synchronous, but rare)
     loop = asyncio.get_running_loop()
     ok = await loop.run_in_executor(None, start)
     if not ok:
@@ -330,19 +410,48 @@ async def _do_generate(
     if not img_b64_list:
         raise StarletteHTTPException(504, _openai_error("Generation timed out (300s)", type_="timeout_error"))
 
+    # Save decoded images with unique names for URL serving.
+    saved = []
+    for idx, image_b64 in enumerate(img_b64_list):
+        filename = f"{uuid.uuid4().hex}_{idx}.png"
+        filepath = os.path.join(OUTPUT_DIR, filename)
+        with open(filepath, "wb") as f:
+            f.write(base64.b64decode(image_b64))
+        saved.append({
+            "filename": filename,
+            "width": width,
+            "height": height,
+            "b64": image_b64,
+        })
+
     return {
         "status": "ok",
-        "image": img_b64_list[0],
-        "images": img_b64_list,
-        "format": "png",
+        "images": saved,
         "seed": wf["3"]["inputs"]["seed"],
         "prompt": prompt,
     }
 
 
+def _build_fal_response(result: dict, public_url: str) -> dict:
+    images = []
+    for item in result["images"]:
+        images.append({
+            "url": f"{public_url}/outputs/{item['filename']}",
+            "width": item["width"],
+            "height": item["height"],
+            "content_type": "image/png",
+        })
+    return {
+        "images": images,
+        "prompt": result["prompt"],
+        "seed": result["seed"],
+        "has_nsfw_concepts": [False] * len(images),
+    }
+
+
 @app.post("/generate")
 async def generate(req: GenerateRequest):
-    return await _do_generate(
+    result = await _do_generate(
         req.prompt,
         req.negative_prompt,
         req.width,
@@ -352,6 +461,14 @@ async def generate(req: GenerateRequest):
         req.seed,
         req.batch_size,
     )
+    return {
+        "status": "ok",
+        "image": result["images"][0]["b64"],
+        "images": [item["b64"] for item in result["images"]],
+        "format": "png",
+        "seed": result["seed"],
+        "prompt": req.prompt,
+    }
 
 
 @app.get("/v1/models", response_model=None)
@@ -376,6 +493,7 @@ async def list_models(authorization: str | None = Header(None)):
 
 @app.post("/v1/images/generations", response_model=None)
 async def create_image_generation(
+    request: Request,
     req: ImageGenerationRequest,
     authorization: str | None = Header(None),
 ):
@@ -399,15 +517,117 @@ async def create_image_generation(
 
     created = int(time.time())
     data: list[dict] = []
-    for image_b64 in result["images"]:
-        item: dict = {"revised_prompt": req.prompt}
+    public_url = PUBLIC_URL or _public_url(request)
+    for item in result["images"]:
+        item_url = f"{public_url}/outputs/{item['filename']}"
+        entry: dict = {"revised_prompt": req.prompt}
         if req.response_format == "url":
-            item["url"] = f"data:image/png;base64,{image_b64}"
+            entry["url"] = item_url
         else:
-            item["b64_json"] = image_b64
-        data.append(item)
+            entry["b64_json"] = item["b64"]
+        data.append(entry)
 
     return {"created": created, "data": data}
+
+
+@app.post("/fal/run/{model_id:path}", response_model=None)
+@app.post("/{model_id:path}", response_model=None)
+async def fal_run(
+    request: Request,
+    model_id: str,
+    req: FalGenerateRequest,
+):
+    """FAL.ai-compatible synchronous text-to-image endpoint."""
+    width, height = _resolve_size(
+        req.image_size,
+        req.aspect_ratio,
+        req.width,
+        req.height,
+        default=(1024, 1024),
+    )
+
+    # Editing is not supported by this ComfyUI workflow.
+    if req.image_url:
+        return _error_response(
+            "Image-to-image editing is not supported by this backend",
+            400,
+            type_="invalid_request_error",
+        )
+
+    result = await _do_generate(
+        req.prompt,
+        req.negative_prompt or "ugly, blurry, low quality, deformed",
+        width,
+        height,
+        req.num_inference_steps if req.num_inference_steps is not None else 20,
+        req.guidance_scale if req.guidance_scale is not None else 7.0,
+        req.seed if req.seed is not None else -1,
+        req.num_images if req.num_images is not None else 1,
+    )
+
+    public_url = _public_url(request)
+    return _build_fal_response(result, public_url)
+
+
+@app.post("/fal/queue/{model_id:path}", response_model=None)
+async def fal_queue(
+    request: Request,
+    model_id: str,
+    req: FalGenerateRequest,
+):
+    """FAL.ai-compatible async submission. We generate synchronously and return a completed request_id."""
+    request_id = f"req-{uuid.uuid4().hex}"
+    width, height = _resolve_size(
+        req.image_size,
+        req.aspect_ratio,
+        req.width,
+        req.height,
+        default=(1024, 1024),
+    )
+
+    if req.image_url:
+        return _error_response(
+            "Image-to-image editing is not supported by this backend",
+            400,
+            type_="invalid_request_error",
+        )
+
+    result = await _do_generate(
+        req.prompt,
+        req.negative_prompt or "ugly, blurry, low quality, deformed",
+        width,
+        height,
+        req.num_inference_steps if req.num_inference_steps is not None else 20,
+        req.guidance_scale if req.guidance_scale is not None else 7.0,
+        req.seed if req.seed is not None else -1,
+        req.num_images if req.num_images is not None else 1,
+    )
+
+    # Store result in memory for status endpoint.
+    _fal_results[request_id] = {"model_id": model_id, "result": result, "request": request}
+    return {"request_id": request_id, "status": "COMPLETED", "response_url": f"{_public_url(request)}/fal/queue/{model_id}/requests/{request_id}/status"}
+
+
+_fal_results: dict[str, dict] = {}
+
+
+@app.get("/fal/queue/{model_id:path}/requests/{request_id}/status", response_model=None)
+async def fal_queue_status(
+    request: Request,
+    model_id: str,
+    request_id: str,
+):
+    """FAL.ai-compatible async status endpoint."""
+    item = _fal_results.get(request_id)
+    if not item:
+        return _error_response("Request not found", 404, type_="invalid_request_error")
+    public_url = _public_url(request)
+    return {
+        "status": "COMPLETED",
+        "request_id": request_id,
+        "response_url": f"{public_url}/fal/queue/{model_id}/requests/{request_id}/status",
+        "output": _build_fal_response(item["result"], public_url),
+    }
 
 
 @app.get("/health", response_model=None)
