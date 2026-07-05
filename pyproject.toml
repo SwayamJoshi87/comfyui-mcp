@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "comfyui-openai-api"
 version = "1.0.0"
-description = "OpenAI-compatible image generation API backed by the ComfyUI on-demand GPU wrapper"
+description = "OpenAI-compatible image generation API with ComfyUI cold-start wrapper"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.110",
@@ -16,13 +16,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["comfyui_api*"]
-
-[project.scripts]
-comfyui-openai-api = "comfyui_api.server:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

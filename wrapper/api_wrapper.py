@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 """
-ComfyUI Auto API - starts on demand, shuts down after idle.
+ComfyUI OpenAI-Compatible Auto API - starts on demand, shuts down after idle.
 USAGE: python3 api_wrapper.py [--port 8000] [--comfy-port 8188] [--idle-timeout 300] [--models-dir ...]
 """
 
 import argparse
 import asyncio
 import base64
-import json
 import os
 import signal
 import subprocess
 import sys
 import threading
 import time
+from typing import Literal
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 # --- Parse args ---
 parser = argparse.ArgumentParser()
@@ -34,9 +37,11 @@ COMFYUI_PORT = args.comfy_port
 API_PORT = args.port
 IDLE_TIMEOUT = args.idle_timeout
 BASE_URL = f"http://127.0.0.1:{COMFYUI_PORT}"
+API_KEY = os.environ.get("OPENAI_API_KEY")
+MODEL_ID = os.environ.get("MODEL_ID", "comfyui-sd1-5")
 
 # --- App ---
-app = FastAPI(title="ComfyUI Auto API")
+app = FastAPI(title="ComfyUI OpenAI-Compatible Auto API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -58,6 +63,84 @@ class GenerateRequest(BaseModel):
     cfg: float = Field(7.0, ge=1.0, le=30.0)
     seed: int = Field(-1)
     batch_size: int = Field(1, ge=1, le=4)
+
+
+class ImageGenerationRequest(BaseModel):
+    prompt: str = Field(..., min_length=1, description="Text prompt")
+    model: str | None = Field(default=MODEL_ID, description="Model id (currently informational)")
+    n: int = Field(default=1, ge=1, le=4, description="Number of images to generate")
+    quality: str | None = Field(default="standard", description="OpenAI quality hint (ignored)")
+    response_format: Literal["url", "b64_json"] = Field(default="b64_json")
+    size: str = Field(default="512x512", description="WIDTHxHEIGHT, e.g. 512x512")
+    style: str | None = Field(default=None, description="OpenAI style hint (ignored)")
+    user: str | None = Field(default=None, description="OpenAI user tracking (ignored)")
+    # ComfyUI-specific overrides
+    negative_prompt: str | None = Field(default=None)
+    width: int | None = Field(default=None, ge=256, le=2048)
+    height: int | None = Field(default=None, ge=256, le=2048)
+    steps: int | None = Field(default=None, ge=1, le=150)
+    cfg: float | None = Field(default=None, ge=1.0, le=30.0)
+    seed: int | None = Field(default=None)
+
+    @field_validator("size")
+    @classmethod
+    def _validate_size(cls, value: str) -> str:
+        try:
+            width, height = (int(x) for x in value.lower().split("x"))
+        except ValueError as exc:
+            raise ValueError('size must be "WIDTHxHEIGHT", e.g. "512x512"') from exc
+        if width < 256 or width > 2048 or height < 256 or height > 2048:
+            raise ValueError("size dimensions must be between 256 and 2048")
+        return value
+
+
+def _openai_error(
+    message: str,
+    type_: str = "invalid_request_error",
+    code: str | None = None,
+) -> dict:
+    return {"error": {"message": message, "type": type_, "param": None, "code": code}}
+
+
+def _error_response(
+    message: str,
+    status_code: int,
+    type_: str = "invalid_request_error",
+    code: str | None = None,
+) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content=_openai_error(message, type_, code))
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    detail = exc.detail
+    if isinstance(detail, dict) and "error" in detail:
+        return JSONResponse(status_code=exc.status_code, content=detail)
+    return _error_response(str(detail), exc.status_code, type_="api_error")
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    messages = []
+    for error in exc.errors():
+        loc = ".".join(str(x) for x in error.get("loc", []))
+        messages.append(f"{loc}: {error.get('msg', 'invalid value')}")
+    return _error_response("; ".join(messages), 422, type_="invalid_request_error")
+
+
+async def _check_auth(authorization: str | None) -> JSONResponse | None:
+    if not API_KEY:
+        return None
+    if not authorization:
+        return _error_response(
+            "Missing Authorization header", 401, type_="authentication_error"
+        )
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or token != API_KEY:
+        return _error_response("Invalid API key", 401, type_="authentication_error")
+    return None
 
 
 def is_process_alive() -> bool:
@@ -176,8 +259,17 @@ def build_workflow(prompt, neg, w, h, steps, cfg, seed, bs):
     }
 
 
-@app.post("/generate")
-async def generate(req: GenerateRequest):
+async def _do_generate(
+    prompt: str,
+    negative_prompt: str,
+    width: int,
+    height: int,
+    steps: int,
+    cfg: float,
+    seed: int,
+    batch_size: int,
+) -> dict:
+    """Core generation logic shared by /generate and /v1/images/generations."""
     global last_request_time
     last_request_time = time.time()
 
@@ -185,27 +277,27 @@ async def generate(req: GenerateRequest):
     loop = asyncio.get_running_loop()
     ok = await loop.run_in_executor(None, start)
     if not ok:
-        raise HTTPException(503, "ComfyUI failed to start")
+        raise StarletteHTTPException(503, _openai_error("ComfyUI failed to start", type_="comfyui_error"))
 
     wf = build_workflow(
-        req.prompt,
-        req.negative_prompt,
-        req.width,
-        req.height,
-        req.steps,
-        req.cfg,
-        req.seed,
-        req.batch_size,
+        prompt,
+        negative_prompt,
+        width,
+        height,
+        steps,
+        cfg,
+        seed,
+        batch_size,
     )
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(f"{BASE_URL}/prompt", json={"prompt": wf})
             if r.status_code != 200:
-                raise HTTPException(502, f"ComfyUI error: {r.text}")
+                raise StarletteHTTPException(502, _openai_error(f"ComfyUI error: {r.text}", type_="comfyui_error"))
             prompt_id = r.json().get("prompt_id")
     except httpx.RequestError as e:
-        raise HTTPException(502, f"Connection error: {e}")
+        raise StarletteHTTPException(502, _openai_error(f"Connection error: {e}", type_="connection_error"))
 
     img_b64_list = []
     last_idle_refresh = 0
@@ -236,32 +328,109 @@ async def generate(req: GenerateRequest):
             await asyncio.sleep(1)
 
     if not img_b64_list:
-        raise HTTPException(504, "Generation timed out (300s)")
+        raise StarletteHTTPException(504, _openai_error("Generation timed out (300s)", type_="timeout_error"))
+
     return {
         "status": "ok",
         "image": img_b64_list[0],
         "images": img_b64_list,
         "format": "png",
         "seed": wf["3"]["inputs"]["seed"],
-        "prompt": req.prompt,
+        "prompt": prompt,
     }
 
 
-@app.get("/health")
-async def health():
+@app.post("/generate")
+async def generate(req: GenerateRequest):
+    return await _do_generate(
+        req.prompt,
+        req.negative_prompt,
+        req.width,
+        req.height,
+        req.steps,
+        req.cfg,
+        req.seed,
+        req.batch_size,
+    )
+
+
+@app.get("/v1/models", response_model=None)
+async def list_models(authorization: str | None = Header(None)):
+    if auth_error := await _check_auth(authorization):
+        return auth_error
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": MODEL_ID,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "comfyui",
+                "permission": [],
+                "root": MODEL_ID,
+                "parent": None,
+            }
+        ],
+    }
+
+
+@app.post("/v1/images/generations", response_model=None)
+async def create_image_generation(
+    req: ImageGenerationRequest,
+    authorization: str | None = Header(None),
+):
+    if auth_error := await _check_auth(authorization):
+        return auth_error
+
+    size_w, size_h = (int(x) for x in req.size.lower().split("x"))
+    width = req.width if req.width is not None else size_w
+    height = req.height if req.height is not None else size_h
+
+    result = await _do_generate(
+        req.prompt,
+        req.negative_prompt or "ugly, blurry, low quality, deformed",
+        width,
+        height,
+        req.steps if req.steps is not None else 20,
+        req.cfg if req.cfg is not None else 7.0,
+        req.seed if req.seed is not None else -1,
+        req.n,
+    )
+
+    created = int(time.time())
+    data: list[dict] = []
+    for image_b64 in result["images"]:
+        item: dict = {"revised_prompt": req.prompt}
+        if req.response_format == "url":
+            item["url"] = f"data:image/png;base64,{image_b64}"
+        else:
+            item["b64_json"] = image_b64
+        data.append(item)
+
+    return {"created": created, "data": data}
+
+
+@app.get("/health", response_model=None)
+async def health(authorization: str | None = Header(None)):
+    if auth_error := await _check_auth(authorization):
+        return auth_error
     alive = is_process_alive()
     return {"status": "ok", "comfyui_running": alive, "idle_timeout": IDLE_TIMEOUT}
 
 
-@app.get("/status")
-async def status_ep():
+@app.get("/status", response_model=None)
+async def status_ep(authorization: str | None = Header(None)):
+    if auth_error := await _check_auth(authorization):
+        return auth_error
     alive = is_process_alive()
     idle = int(time.time() - last_request_time) if last_request_time else None
     return {"comfyui_running": alive, "last_request_s": idle, "idle_timeout": IDLE_TIMEOUT}
 
 
-@app.post("/stop")
-async def stop_ep():
+@app.post("/stop", response_model=None)
+async def stop_ep(authorization: str | None = Header(None)):
+    if auth_error := await _check_auth(authorization):
+        return auth_error
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, stop)
     return {"status": "ok", "comfyui_running": False}
