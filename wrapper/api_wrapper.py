@@ -207,7 +207,7 @@ async def generate(req: GenerateRequest):
     except httpx.RequestError as e:
         raise HTTPException(502, f"Connection error: {e}")
 
-    img_b64 = None
+    img_b64_list = []
     last_idle_refresh = 0
     async with httpx.AsyncClient(timeout=10.0) as client:
         for i in range(300):  # up to 300s
@@ -224,23 +224,27 @@ async def generate(req: GenerateRequest):
                             p = os.path.join(COMFYUI_DIR, "output", img["filename"])
                             if os.path.exists(p):
                                 with open(p, "rb") as f:
-                                    img_b64 = base64.b64encode(f.read()).decode()
+                                    img_b64_list.append(base64.b64encode(f.read()).decode())
                                 try:
                                     os.remove(p)
                                 except Exception:
                                     pass
-                                break
-                        if img_b64:
-                            break
-                    if img_b64:
+                    if img_b64_list:
                         break
             except Exception:
                 pass
             await asyncio.sleep(1)
 
-    if not img_b64:
+    if not img_b64_list:
         raise HTTPException(504, "Generation timed out (300s)")
-    return {"status": "ok", "image": img_b64, "format": "png", "seed": wf["3"]["inputs"]["seed"], "prompt": req.prompt}
+    return {
+        "status": "ok",
+        "image": img_b64_list[0],
+        "images": img_b64_list,
+        "format": "png",
+        "seed": wf["3"]["inputs"]["seed"],
+        "prompt": req.prompt,
+    }
 
 
 @app.get("/health")
